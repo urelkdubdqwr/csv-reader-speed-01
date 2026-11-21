@@ -9,7 +9,9 @@
 //   * every field is taken as one bulk slice of the source rather than built up a
 //     character at a time;
 //   * the quoted scanner keeps a lazy `parts` array, so the common quoted field (no ""
-//     and no CR inside) becomes a single slice with zero array allocations.
+//     and no CR inside) becomes a single slice with zero array allocations;
+//   * the unquoted scanner jumps a run of ordinary characters with one slice instead of
+//     stepping a character at a time (the run is the common case by far).
 //
 // Pure: no clock, no randomness, no locale, nothing kept from one call to the next.
 
@@ -65,7 +67,10 @@ export function run(input) {
       forceUnquoted = false;
       const seeded = seedQuote;
       seedQuote = false;
-      if (text.charCodeAt(pos) === QUOTE) {
+      // A field re-read after an unterminated_quote is unquoted even when its first
+      // character is a quote: the seed makes that quote a literal and any further
+      // quote in the run a literal too (the reference reads it with readUnquoted).
+      if (!seeded && text.charCodeAt(pos) === QUOTE) {
         // --- quoted field: runs to the next quote that is not doubled ---
         lastQuoted = true;
         const open = pos;
@@ -187,10 +192,21 @@ export function run(input) {
       }
 
       // --- unquoted field (also the reread after an unterminated_quote) ---
+      // The field's characters run to the next comma or line break. A run of ordinary
+      // characters is jumped in one step by scanning for the next interesting code
+      // point; a lone CR is dropped (stray_cr) and the rest of the run is joined on.
       const start = pos;
       let parts = seeded ? ['"'] : null;
       let segStart = pos;
       for (;;) {
+        // Advance over a run of ordinary characters with no per-character branch.
+        let j = pos;
+        while (j < len) {
+          const c = text.charCodeAt(j);
+          if (c === COMMA || c === LF || c === CR) break;
+          j += 1;
+        }
+        pos = j;
         if (pos >= len) {
           // end of text ends the field and the record
           if (parts === null) fields.push(text.slice(start, pos));
@@ -221,25 +237,23 @@ export function run(input) {
           line += 1;
           break;
         }
-        if (c === CR) {
-          if (pos + 1 < len && text.charCodeAt(pos + 1) === LF) {
-            if (parts === null) fields.push(text.slice(start, pos));
-            else {
-              parts.push(text.slice(segStart, pos));
-              fields.push(parts.join(''));
-            }
-            pos += 2;
-            line += 1;
-            break;
+        // c === CR
+        if (pos + 1 < len && text.charCodeAt(pos + 1) === LF) {
+          if (parts === null) fields.push(text.slice(start, pos));
+          else {
+            parts.push(text.slice(segStart, pos));
+            fields.push(parts.join(''));
           }
-          errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-          if (parts === null) parts = [];
-          parts.push(text.slice(segStart, pos));
-          pos += 1;
-          segStart = pos;
-          continue;
+          pos += 2;
+          line += 1;
+          break;
         }
+        errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+        if (parts === null) parts = [];
+        parts.push(text.slice(segStart, pos));
         pos += 1;
+        segStart = pos;
+        continue;
       }
     }
 
